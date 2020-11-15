@@ -5,6 +5,20 @@ type priv = X509.Certificate.t list * Mirage_crypto_pk.Rsa.priv
 
 type authenticator = X509.Authenticator.t
 
+module Auth_method = struct
+  module Fingerprints_by_domain = struct
+    type 'a t = ([`host] Domain_name.t, 'a) List.Assoc.t
+  end
+
+  type t =
+    | Ca_file of Filename.t
+    | Ca_dir of Filename.t
+    | Key_fingerprints of Mirage_crypto.Hash.hash * Cstruct.t Fingerprints_by_domain.t
+    | Hex_key_fingerprints of Mirage_crypto.Hash.hash * string Fingerprints_by_domain.t
+    | Cert_fingerprints of Mirage_crypto.Hash.hash * Cstruct.t Fingerprints_by_domain.t
+    | Hex_cert_fingerprints of Mirage_crypto.Hash.hash * string Fingerprints_by_domain.t
+end
+
 let read_dir path =
   Sys.ls_dir path >>| List.map ~f:(Filename.concat path)
 
@@ -100,14 +114,14 @@ let authenticator ?hash_whitelist ?crls meth =
   and cert_fingerp hash fingerprints =
     X509.Authenticator.server_cert_fingerprint ~time ~hash ~fingerprints
   in
-  match meth with
-  | `Ca_file path -> certs_of_pem path >>= of_cas
-  | `Ca_dir path  -> certs_of_pem_dir path >>= of_cas
-  | `Key_fingerprints (hash, fps) -> return (fingerp hash fps)
-  | `Hex_key_fingerprints (hash, fps) ->
+  match (meth : Auth_method.t) with
+  | Ca_file path -> certs_of_pem path >>= of_cas
+  | Ca_dir path  -> certs_of_pem_dir path >>= of_cas
+  | Key_fingerprints (hash, fps) -> return (fingerp hash fps)
+  | Hex_key_fingerprints (hash, fps) ->
     let fps = List.map fps ~f:(fun (n, v) -> (n, dotted_hex_to_cs v)) in
     return (fingerp hash fps)
-  | `Cert_fingerprints (hash, fps) -> return (cert_fingerp hash fps)
-  | `Hex_cert_fingerprints (hash, fps) ->
+  | Cert_fingerprints (hash, fps) -> return (cert_fingerp hash fps)
+  | Hex_cert_fingerprints (hash, fps) ->
     let fps = List.map fps ~f:(fun (n, v) -> (n, dotted_hex_to_cs v)) in
     return (cert_fingerp hash fps)

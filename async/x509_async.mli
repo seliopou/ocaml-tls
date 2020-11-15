@@ -27,15 +27,24 @@ val certs_of_pem_dir
 (** [certs_of_pem_dir dir] is [certificates], which are read from all
    PEM-encoded files in [dir]. *)
 
+module Auth_method : sig
+  module Fingerprints_by_domain : sig
+    type 'a t = ([`host] Domain_name.t, 'a) List.Assoc.t
+  end
+
+  type t =
+    | Ca_file of Filename.t
+    | Ca_dir of Filename.t
+    | Key_fingerprints of Mirage_crypto.Hash.hash * Cstruct.t Fingerprints_by_domain.t
+    | Hex_key_fingerprints of Mirage_crypto.Hash.hash * string Fingerprints_by_domain.t
+    | Cert_fingerprints of Mirage_crypto.Hash.hash * Cstruct.t Fingerprints_by_domain.t
+    | Hex_cert_fingerprints of Mirage_crypto.Hash.hash * string Fingerprints_by_domain.t
+end
+
 val authenticator
-  : ?hash_whitelist:Mirage_crypto.Hash.hash list
+  :  ?hash_whitelist:Mirage_crypto.Hash.hash list
   -> ?crls:Filename.t
-  -> [ `Ca_file of Filename.t
-     | `Ca_dir  of Filename.t
-     | `Key_fingerprints of Mirage_crypto.Hash.hash * ([`host] Domain_name.t * Cstruct.t) list
-     | `Hex_key_fingerprints of Mirage_crypto.Hash.hash * ([`host] Domain_name.t * string) list
-     | `Cert_fingerprints of Mirage_crypto.Hash.hash * ([`host] Domain_name.t * Cstruct.t) list
-     | `Hex_cert_fingerprints of Mirage_crypto.Hash.hash * ([`host] Domain_name.t * string) list ]
+  -> Auth_method.t
   -> authenticator Or_error.t Deferred.t
 (** [authenticator methods] constructs an [authenticator] using the specified
    method and data. *)
