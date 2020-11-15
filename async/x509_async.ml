@@ -1,72 +1,113 @@
-let ( <.> ) f g x = f (g x)
-
 open Core
 open Async
 
-type priv = X509.t list * Nocrypto.Rsa.priv
+type priv = X509.Certificate.t list * Mirage_crypto_pk.Rsa.priv
 
-type authenticator = X509.Authenticator.a
+type authenticator = X509.Authenticator.t
 
-let load_dir path =
-  Sys.ls_dir (Fpath.to_string path) >>| List.map ~f:Fpath.(( / ) path)
+let read_dir path =
+  Sys.ls_dir path >>| List.map ~f:(Filename.concat path)
 
-let load_file path =
-  Monitor.try_with ~run:`Now (fun () ->
-      Reader.file_contents (Fpath.to_string path) >>| Cstruct.of_string )
+let read_file path =
+  Monitor.try_with ~rest:`Raise ~run:`Now (fun () ->
+    let%map contents = Reader.file_contents path  in
+    Cstruct.of_string contents)
   >>| function
   | Ok v -> Ok v
   | Error exn ->
-    Or_error.error (Fmt.strf "Failed to load file %a" Fpath.pp path) exn Exn.sexp_of_t
+    Or_error.error (sprintf "Failed to load file %s" path) exn Exn.sexp_of_t
 
 let private_of_pems ~cert ~priv_key =
-  let open X509.Encoding.Pem in
-  load_file cert
-  >>| Result.map ~f:Certificate.of_pem_cstruct
-  >>= fun certs ->
-  load_file priv_key
-  >>| Result.map ~f:Private_key.of_pem_cstruct1
-  >>| fun pk ->
-  match (certs, pk) with
-  | Ok certs, Ok (`RSA pk) -> (Ok (certs, pk))
-  | (Error _ as err), Ok _ -> err
-  | Ok _, (Error _ as err) -> err
-  | Error err0, Error err1 -> Or_error.both (Error err0) (Error err1)
+  let open Deferred.Or_error.Let_syntax in
+  let%bind (cert : X509.Certificate.t List.t) =
+    let%bind cert = read_file cert  in
+    match X509.Certificate.decode_pem_multiple cert with
+    | Ok cs -> return cs
+    | Error (`Msg msg) ->
+      Deferred.return
+        (Or_error.error_s [%message "failed to parse certificates" (msg : string)])
+  and pk =
+    let%bind pk = read_file priv_key  in
+    match X509.Private_key.decode_pem pk with
+    | Ok (`RSA key) -> return key
+    | Error (`Msg msg) ->
+      Deferred.return
+        (Or_error.error_s [%message "failed to parse private key" (msg : string)])
+  in
+  return (cert, pk)
+;;
 
 let certs_of_pem path =
-  load_file path >>| Result.map ~f:X509.Encoding.Pem.Certificate.of_pem_cstruct
+  let open Deferred.Or_error.Let_syntax in
+  let%bind certs = read_file path in
+  X509.Certificate.decode_pem_multiple certs
+  |> Result.map_error ~f:(fun (`Msg msg) ->
+      Error.create_s [%message "failed to parse certificates" (msg : string)])
+  |> Deferred.return
+;;
+
+let matches_extension ~ext:needle filename =
+  let _, extension = Filename.split_extension filename in
+  match extension with
+  | None -> false
+  | Some extension -> String.equal extension needle
+;;
 
 let certs_of_pem_dir ?(ext = "crt") path =
-  load_dir path
-  >>| List.filter ~f:(Fpath.has_ext ext)
-  >>= Deferred.List.concat_map ~how:`Parallel ~f:(fun path ->
-          certs_of_pem path
-          >>| function
-          | Ok certs -> certs
-          | Error err ->
-              Fmt.epr "Silently got an error when we tried to load %a: %a"
-                Fpath.pp path Error.pp err ;
-              [] )
+  let%bind files = read_dir path in
+  List.filter files ~f:(matches_extension ~ext)
+  |> Deferred.Or_error.List.concat_map ~how:`Parallel ~f:certs_of_pem
+;;
 
-let authenticator meth =
-  let time = Synchronous_time_source.wall_clock () in
-  let now =
-    Synchronous_time_source.now time
-    |> Time_ns.to_span_since_epoch |> Time_ns.Span.to_int_sec
+let crl_of_pem path =
+  let open Deferred.Or_error.Let_syntax in
+  let%bind data = read_file path in
+  X509.CRL.decode_der data
+  |> Result.map_error ~f:(fun (`Msg msg) ->
+      Error.create_s [%message "failed to parse CRL" (msg : string)])
+  |> Deferred.return
+;;
+
+let crls_of_pem_dir path =
+  let%bind files  = read_dir path in
+  List.filter files ~f:(matches_extension ~ext:"crt")
+  |> Deferred.Or_error.List.map ~how:`Parallel ~f:crl_of_pem
+;;
+
+let authenticator ?hash_whitelist ?crls meth =
+  let time () =
+    Synchronous_time_source.wall_clock ()
+    |> Synchronous_time_source.now
+    |> Time_ns.to_int_ns_since_epoch
     |> Ptime.Span.of_int_s |> Ptime.of_span
-    |> fun opt -> Option.value_exn ~message:"Invalid time value" opt
+    |> Option.value_exn ~message:"Invalid time value"
+    |> Some
   in
-  let of_meth meth = X509.Authenticator.chain_of_trust ~time:now meth
-  and dotted_hex_to_cs =
-    Nocrypto.Uncommon.Cs.of_hex
-    <.> String.map ~f:(function ':' -> ' ' | x -> x)
-  and fingerprint hash fingerprints =
-    X509.Authenticator.server_key_fingerprint ~time:now ~hash ~fingerprints
+  let open Deferred.Or_error.Let_syntax in
+  let of_cas cas =
+    let%map crls =
+      match crls with
+      | None -> return None
+      | Some path ->
+        let%map crls = crls_of_pem_dir path in
+        Some crls
+    in
+    X509.Authenticator.chain_of_trust ?hash_whitelist ?crls ~time cas
+  and dotted_hex_to_cs hex =
+    Cstruct.of_hex (String.tr ~target:':' ~replacement:' ' hex)
+  and fingerp hash fingerprints =
+    X509.Authenticator.server_key_fingerprint ~time ~hash ~fingerprints
+  and cert_fingerp hash fingerprints =
+    X509.Authenticator.server_cert_fingerprint ~time ~hash ~fingerprints
   in
   match meth with
-  | `Ca_file path -> certs_of_pem path >>| Result.map ~f:of_meth
-  | `Ca_dir path -> certs_of_pem_dir path >>| of_meth >>| Result.return
-  | `Key_fingerprints (hash, fps) -> return (Ok (fingerprint hash fps))
+  | `Ca_file path -> certs_of_pem path >>= of_cas
+  | `Ca_dir path  -> certs_of_pem_dir path >>= of_cas
+  | `Key_fingerprints (hash, fps) -> return (fingerp hash fps)
   | `Hex_key_fingerprints (hash, fps) ->
-      let fps = List.map ~f:(fun (n, v) -> (n, dotted_hex_to_cs v)) fps in
-      return (Ok (fingerprint hash fps))
-  | `No_authentication -> return (Ok X509.Authenticator.null)
+    let fps = List.map fps ~f:(fun (n, v) -> (n, dotted_hex_to_cs v)) in
+    return (fingerp hash fps)
+  | `Cert_fingerprints (hash, fps) -> return (cert_fingerp hash fps)
+  | `Hex_cert_fingerprints (hash, fps) ->
+    let fps = List.map fps ~f:(fun (n, v) -> (n, dotted_hex_to_cs v)) in
+    return (cert_fingerp hash fps)
