@@ -1,0 +1,4 @@
+(library
+ (name tls_async)
+ (public_name tls-async)
+ (libraries mirage-crypto-rng mirage-crypto-rng-async core async x509 tls))
